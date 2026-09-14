@@ -19,39 +19,47 @@ Angel SmartAPI data, not assumption - that:
      so we know up front whether there is even enough sample size to
      honestly train/test-split later (same discipline as scout37/39/40).
 
-We do NOT hardcode India VIX's symboltoken (Angel occasionally changes/
-reassigns tokens). Instead we resolve it live via the official searchScrip
-endpoint, exactly like Angel's own docs describe, and only fail loudly if
-that lookup itself fails - never guess a token number.
+TOKEN NOTE (2026-09-14): the live run of v1 of this script proved that
+Angel's order/v1/searchScrip endpoint does NOT index pure quote-only
+indices (it returned "AB4047: Scrip not found in scrip master cache" for
+INDIAVIX, the same way it would for NIFTY/BANKNIFTY/SENSEX - searchScrip
+is for TRADABLE instruments only). So, exactly like scout37 already does
+for NIFTY/BANKNIFTY/SENSEX (see INDEX_INSTRUMENTS there), we now use
+India VIX's own published NSE symboltoken directly: 99926017 (confirmed
+against Angel's own SmartAPI forum announcement of index token coverage,
+same "998269xx"-style new-format numbering as NIFTY=99926000 and
+BANKNIFTY=99926009). searchScrip is still called first, purely as an
+informational cross-check that is allowed to fail without stopping the
+script - the hardcoded token is what actually drives the data fetch.
 """
 import sys, os, datetime, statistics
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scout37_sideways_regime_report as s37   # reuse get_api() / auth only
 
+VIX_EXCHANGE = "NSE"
+VIX_TOKEN = "99926017"   # India VIX - same numbering family as NIFTY 99926000 / BANKNIFTY 99926009
 
-def resolve_vix_token(api):
-    """Look up India VIX's NSE symboltoken via the official Search Scrip
-    endpoint instead of hardcoding a token number."""
-    resp = api.searchScrip(exchange="NSE", searchscrip="INDIAVIX")
-    if not resp or not resp.get("status") or not resp.get("data"):
-        print(f"  [FAIL] searchScrip('INDIAVIX') returned nothing usable: {resp}")
-        return None
-    for row in resp["data"]:
-        sym = (row.get("tradingsymbol") or "").upper()
-        if sym in ("INDIAVIX", "INDIA VIX"):
-            print(f"  resolved: tradingsymbol={row.get('tradingsymbol')} "
-                  f"symboltoken={row.get('symboltoken')} exchange={row.get('exchange')}")
-            return row.get("symboltoken")
-    # fall back to first result if exact name match isn't found
-    row = resp["data"][0]
-    print(f"  [WARN] no exact 'INDIAVIX' match, using first result: {row}")
-    return row.get("symboltoken")
+
+def try_search_scrip_crosscheck(api):
+    """Informational only: try the Search Scrip endpoint and print whatever
+    it says, but NEVER fail the script over this - it's known to not cover
+    pure quote-only indices (confirmed live: AB4047 for INDIAVIX)."""
+    try:
+        resp = api.searchScrip(exchange=VIX_EXCHANGE, searchscrip="INDIAVIX")
+    except Exception as e:
+        print(f"  (searchScrip cross-check raised {e!r} - ignoring, not fatal)")
+        return
+    if resp and resp.get("status") and resp.get("data"):
+        print(f"  (searchScrip cross-check found: {resp['data']})")
+    else:
+        print(f"  (searchScrip cross-check: no match - expected for quote-only "
+              f"indices, continuing with hardcoded token {VIX_TOKEN})")
 
 
 def fetch_daily(api, token, from_dt, to_dt):
     params = {
-        "exchange": "NSE",
+        "exchange": VIX_EXCHANGE,
         "symboltoken": token,
         "interval": "ONE_DAY",
         "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
@@ -87,21 +95,18 @@ def main():
     print("=== scout41_vix_check: India VIX data-availability + fear-spike scan ===\n")
     api = s37.get_api()
 
-    print("Step 1: resolve INDIAVIX symboltoken via searchScrip ...")
-    token = resolve_vix_token(api)
-    if not token:
-        print("\nSTOP: cannot resolve India VIX token - this data source is not "
-              "usable via SmartAPI, need a different approach.")
-        return
-    print()
+    print("Step 1: informational searchScrip cross-check (not fatal if it fails) ...")
+    try_search_scrip_crosscheck(api)
+    print(f"\nUsing hardcoded India VIX token: exchange={VIX_EXCHANGE} symboltoken={VIX_TOKEN}\n")
 
     to_dt = datetime.datetime.now()
     from_dt = to_dt - datetime.timedelta(days=3 * 365 + 10)
     print(f"Step 2: fetch daily candles {from_dt.date()} -> {to_dt.date()} ...")
-    rows = fetch_daily(api, token, from_dt, to_dt)
+    rows = fetch_daily(api, VIX_TOKEN, from_dt, to_dt)
     print(f"  got {len(rows)} daily bars\n")
     if not rows:
-        print("STOP: no VIX candle data returned at all.")
+        print("STOP: no VIX candle data returned at all - token may be wrong, "
+              "need to re-verify against Angel's scrip master.")
         return
 
     closes = [r["c"] for r in rows]
