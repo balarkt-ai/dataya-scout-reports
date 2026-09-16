@@ -153,6 +153,11 @@ def _expiry_key(r):
 
 
 def analyze_optidx_contract(master, index_name, exch_seg_guess="NFO"):
+    """Returns (min_strike, max_strike) from the nearest expiry's real strike
+    list, or None if nothing could be found - used by
+    resolve_spot_token_by_ltp() below to auto-disambiguate between multiple
+    spot-token candidates (a real index level should sit inside, or very
+    close to, its own nearest-expiry strike range)."""
     print(f"\n--- {index_name}: OPTIDX CONTRACT FACTS ---")
     rows = [r for r in master if r.get("instrumenttype") == "OPTIDX"
             and str(r.get("name", "")).upper() == index_name.upper()]
@@ -164,7 +169,7 @@ def analyze_optidx_contract(master, index_name, exch_seg_guess="NFO"):
         print(f"  STILL NOTHING - {index_name} may not currently have any listed OPTIDX contracts "
               f"(discontinued entirely, or a different name is used - check the spot search above "
               f"for hints on the real naming).")
-        return
+        return None
 
     exch_segs = sorted({r.get("exch_seg") for r in rows})
     print(f"  {len(rows)} total OPTIDX rows found, exch_seg(s): {exch_segs}")
@@ -183,6 +188,7 @@ def analyze_optidx_contract(master, index_name, exch_seg_guess="NFO"):
     print(f"  distinct lotsize value(s) found across all listed contracts: {lotsizes}")
 
     nearest_expiry = expiries[0] if expiries else None
+    strike_range = None
     if nearest_expiry:
         near_rows = [r for r in rows if r.get("expiry") == nearest_expiry]
         strikes = sorted({round(float(r.get("strike", "-1")) / 100, 2) for r in near_rows if r.get("strike")})
@@ -194,14 +200,68 @@ def analyze_optidx_contract(master, index_name, exch_seg_guess="NFO"):
                   f"(the smallest recurring value is almost always the true strike interval)")
         sample = sorted({r.get("symbol") for r in near_rows})[:6]
         print(f"  sample tradingsymbols: {sample}")
+        if strikes:
+            strike_range = (strikes[0], strikes[-1])
+    return strike_range
 
 
-def probe_index_15min_depth(api, token, label, days_back=730):
+def resolve_spot_token_by_ltp(api, candidates, strike_range, label):
+    """When more than one plausible no-expiry NSE/BSE spot row was found,
+    resolve it WITHOUT guessing: fetch each candidate's real LTP and check
+    which one lands inside (or very near) the SAME index's real nearest-
+    expiry strike range already found above - a genuine index level always
+    sits close to its own current option strikes; an unrelated/wrong token
+    won't. Returns the winning candidate row, or None if the check itself
+    is inconclusive (never silently picks one on a coin flip)."""
+    if not candidates:
+        return None
+    if strike_range is None:
+        print(f"  {label}: no strike range available to cross-check against - cannot auto-resolve, "
+              f"needs a human look at the candidate rows above.")
+        return None
+    lo, hi = strike_range
+    margin = (hi - lo) * 0.5  # generous - the exact ATM level can sit anywhere inside/near the range
+    print(f"\n--- {label}: RESOLVING SPOT TOKEN AMONG {len(candidates)} CANDIDATE(S) VIA REAL LTP ---")
+    print(f"  (checking each candidate's LTP against the real nearest-expiry strike range {lo}-{hi}, "
+          f"+/-{margin:.0f} margin)")
+    winners = []
+    for r in candidates:
+        token = r.get("token")
+        symbol = r.get("symbol")
+        exch = r.get("exch_seg")
+        try:
+            resp = api.ltpData(exch, symbol, str(token))
+            ltp = float(resp["data"]["ltp"]) if resp and resp.get("status") else None
+        except Exception as e:
+            ltp = None
+            print(f"    token={token} symbol={symbol!r}: LTP fetch error - {e}")
+            continue
+        in_range = ltp is not None and (lo - margin) <= ltp <= (hi + margin)
+        print(f"    token={token} symbol={symbol!r} exch={exch}: LTP={ltp} "
+              f"{'-> INSIDE the strike range (likely the real spot token)' if in_range else '-> outside range'}")
+        if in_range:
+            winners.append(r)
+        time.sleep(0.3)
+    if len(winners) == 1:
+        print(f"  RESOLVED: {label} spot token = {winners[0].get('token')} ({winners[0].get('symbol')!r}) "
+              f"- the only candidate whose real LTP matches its own option strike range.")
+        return winners[0]
+    elif len(winners) == 0:
+        print(f"  INCONCLUSIVE: no candidate's LTP landed inside the expected range - needs a human look, "
+              f"not guessed.")
+        return None
+    else:
+        print(f"  INCONCLUSIVE: {len(winners)} candidates all landed inside the range (unexpected) - "
+              f"needs a human look, not guessed.")
+        return None
+
+
+def probe_index_15min_depth(api, token, label, exch_seg="NSE", days_back=730):
     """Small, fast probe (NOT a full fetch) - just confirms candles come
     back at all for a plausible token before committing to a full multi-
     year pull in a later script, and gives a rough sense of the real depth
     via a handful of spaced date-range checks rather than one giant call."""
-    print(f"\n--- {label}: 15-MIN CANDLE PROBE (token {token}) ---")
+    print(f"\n--- {label}: 15-MIN CANDLE PROBE (token {token}, exchange {exch_seg}) ---")
     now = datetime.datetime.now()
     checkpoints = [30, 180, 365, 730]
     for days in checkpoints:
@@ -211,7 +271,7 @@ def probe_index_15min_depth(api, token, label, days_back=730):
         end = start + datetime.timedelta(days=3)
         try:
             resp = api.getCandleData({
-                "exchange": "NSE", "symboltoken": str(token), "interval": "FIFTEEN_MINUTE",
+                "exchange": exch_seg, "symboltoken": str(token), "interval": "FIFTEEN_MINUTE",
                 "fromdate": start.strftime("%Y-%m-%d %H:%M"), "todate": end.strftime("%Y-%m-%d %H:%M"),
             })
             rows = (resp or {}).get("data") or []
@@ -230,23 +290,33 @@ def main():
     finnifty_spot_candidates = find_spot_index_candidates(master, FINNIFTY_PATTERNS, "FINNIFTY")
     midcp_spot_candidates = find_spot_index_candidates(master, MIDCPNIFTY_PATTERNS, "MIDCPNIFTY")
 
-    analyze_optidx_contract(master, "FINNIFTY")
-    analyze_optidx_contract(master, "MIDCPNIFTY")
+    finnifty_strike_range = analyze_optidx_contract(master, "FINNIFTY")
+    midcp_strike_range = analyze_optidx_contract(master, "MIDCPNIFTY")
 
-    # Only probe candle depth on a spot candidate if there's exactly one
-    # unambiguous, clearly-index-like row (exch_seg NSE, no expiry field) -
-    # otherwise this is deliberately left for a human decision rather than
-    # guessing which of several candidates is the real spot token.
-    for label, candidates in [("FINNIFTY", finnifty_spot_candidates), ("MIDCPNIFTY", midcp_spot_candidates)]:
-        index_like = [r for r in candidates if r.get("exch_seg") == "NSE" and not r.get("expiry")]
+    # Resolve which spot-token candidate is the real one WITHOUT guessing -
+    # if there's exactly one no-expiry NSE/BSE candidate, use it directly;
+    # if there are several (seen in the real 2026-09-16 run - both FINNIFTY
+    # and MIDCPNIFTY had 2-3 candidates each, an AMXIDX-typed row alongside
+    # a plain empty-instrumenttype row), cross-check each one's real LTP
+    # against its own nearest-expiry strike range rather than picking blind.
+    for label, candidates, strike_range in [
+        ("FINNIFTY", finnifty_spot_candidates, finnifty_strike_range),
+        ("MIDCPNIFTY", midcp_spot_candidates, midcp_strike_range),
+    ]:
+        index_like = [r for r in candidates if r.get("exch_seg") in ("NSE", "BSE") and not r.get("expiry")]
+        resolved = None
         if len(index_like) == 1:
-            probe_index_15min_depth(api, index_like[0]["token"], label)
-        elif len(index_like) == 0:
-            print(f"\n--- {label}: no unambiguous no-expiry NSE row found among the candidates above - "
-                  f"skipping the candle probe, needs a human pick from the printed list first. ---")
+            resolved = index_like[0]
+            print(f"\n--- {label}: only one no-expiry candidate found - using it directly: "
+                  f"token={resolved.get('token')} symbol={resolved.get('symbol')!r} ---")
+        elif len(index_like) > 1:
+            resolved = resolve_spot_token_by_ltp(api, index_like, strike_range, label)
         else:
-            print(f"\n--- {label}: {len(index_like)} ambiguous no-expiry NSE candidates found - "
-                  f"skipping the candle probe until one is confirmed correct (see rows printed above). ---")
+            print(f"\n--- {label}: no unambiguous no-expiry NSE/BSE row found among the candidates above - "
+                  f"needs a human pick from the printed list first. ---")
+
+        if resolved:
+            probe_index_15min_depth(api, resolved["token"], label, exch_seg=resolved.get("exch_seg", "NSE"))
 
     print("\nDone. READ-ONLY discovery complete - no backtest run yet, no order placed, no Pine/webhook "
           "touched. Real output above (not a guess) decides the next step: which row is the true spot "
