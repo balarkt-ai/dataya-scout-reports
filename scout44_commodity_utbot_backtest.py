@@ -142,11 +142,29 @@ def _expiry_key(r):
         return datetime.datetime.max
 
 
+# QUOTE-UNIT CORRECTION (confirmed 2026-09-16 from the FIRST real run's raw
+# cached candle data, not guessed): Angel's scrip-master "lotsize" field is a
+# KG/BARREL/MMBTU *count of the lot's own fundamental unit*, not automatically
+# the rupee-per-point multiplier - those only match when the exchange quotes
+# the PRICE in that same fundamental unit. SILVER (quoted per KG, lot=30KG),
+# CRUDEOIL (quoted per barrel, lot=100 barrels) and NATURALGAS (quoted per
+# mmBtu, lot=1250 mmBtu) all match - field value IS the correct multiplier.
+# GOLD is the one exception: its lot is defined as 1 KG (lotsize field = 1),
+# but Angel/MCX QUOTE the price per 10 GRAMS (confirmed real: front-month
+# GOLD close was ~152,272 on 2026-09-16 - matches the well-known "Rs per 10g"
+# Indian gold-price convention, not a per-kg price which would read ~15
+# lakh+). So 1 lot (1kg = 100 x 10g) needs a x100 correction on top of the
+# field's own value - applied here explicitly and disclosed, never silent.
+QUOTE_UNIT_MULTIPLIER = {"GOLD": 100}
+
+
 def resolve_commodity_token(scrip_master, commodity):
     """Same row-selection rule as scout27 (already real-data-confirmed for
     daily depth): MCX + instrumenttype=='FUTCOM' + exact plain name + the
     nearest-expiry row. Lot size is read directly off that row - never
-    hardcoded. Raises ValueError (never a silent guess) if nothing matches."""
+    hardcoded - then corrected for the quote-unit mismatch above where one
+    is confirmed to apply (currently GOLD only). Raises ValueError (never a
+    silent guess) if nothing matches."""
     rows = [r for r in scrip_master if r.get("exch_seg") == "MCX"
             and r.get("instrumenttype") == "FUTCOM" and r.get("expiry")
             and str(r.get("name", "")).upper() == commodity]
@@ -156,12 +174,17 @@ def resolve_commodity_token(scrip_master, commodity):
     rows.sort(key=_expiry_key)
     nearest = rows[0]
     try:
-        lotsize = int(nearest.get("lotsize") or 0)
+        raw_lotsize = int(nearest.get("lotsize") or 0)
     except Exception:
-        lotsize = 0
-    if lotsize <= 0:
+        raw_lotsize = 0
+    if raw_lotsize <= 0:
         raise ValueError(f"{commodity}: resolved contract {nearest.get('symbol')} has no usable "
                           f"lotsize field ({nearest.get('lotsize')!r}) - skipping, not guessing.")
+    corr = QUOTE_UNIT_MULTIPLIER.get(commodity, 1)
+    lotsize = raw_lotsize * corr
+    if corr != 1:
+        print(f"  {commodity}: raw lotsize field={raw_lotsize}, quote-unit correction x{corr} "
+              f"applied -> true rupee multiplier used = {lotsize}")
     return nearest.get("token"), nearest.get("symbol"), lotsize
 
 
